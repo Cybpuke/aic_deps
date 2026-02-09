@@ -1,8 +1,4 @@
-# values-dependencies.yml
-# Only:
-# - NFS config for Airflow (from tutorial)
-# - pullPolicy override to avoid re-pulling images
-# Everything else uses chart defaults
+# values-deps.yaml (fixed)
 
 mysql:
   image:
@@ -16,7 +12,6 @@ airflow:
     airflow:
       pullPolicy: IfNotPresent
 
-  # ---- tutorial NFS config (unchanged) ----
   airflow:
     extraVolumeMounts:
       - mountPath: /airflow-logs
@@ -34,11 +29,9 @@ airflow:
       AIRFLOW__OPENMETADATA_AIRFLOW_APIS__DAG_GENERATED_CONFIGS: "/airflow-dags/dags"
 
   dags:
-    path: /airflow-dags/dags
     persistence:
       enabled: false
 
   logs:
-    path: /airflow-logs
     persistence:
       enabled: false
