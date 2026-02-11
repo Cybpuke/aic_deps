@@ -1,0 +1,260 @@
+"use client";
+
+import React, { useState, useEffect, useCallback } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
+import dynamic from "next/dynamic";
+import type { ReactFlowSpec } from "@/components/workflow-designer";
+
+const WorkflowCanvas = dynamic(
+    () => import("@/components/workflow-designer/WorkflowCanvas").then((mod) => mod.WorkflowCanvas),
+    { ssr: false, loading: () => <div className="flex items-center justify-center h-[70vh]"><div className="animate-spin h-8 w-8 border-4 border-primary border-t-transparent rounded-full" /></div> }
+);
+import { createWorkflowService, WorkflowDefinition, WorkflowCategory, FlowDefinitionResponse } from "@/lib/services/workflow-service";
+import { useAPIEndpoints } from "@/lib/constants/api";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogFooter,
+    DialogHeader,
+    DialogTitle,
+} from "@/components/ui/dialog";
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
+import { ArrowLeft } from "lucide-react";
+import Link from "next/link";
+
+export default function WorkflowDesignerPage() {
+    const searchParams = useSearchParams();
+    const router = useRouter();
+    const apiEndpoints = useAPIEndpoints();
+
+
+    const workflowId = searchParams.get("id");
+    const isEditing = Boolean(workflowId);
+
+    const [workflowService] = useState(() => createWorkflowService(apiEndpoints));
+    const [definition, setDefinition] = useState<WorkflowDefinition | null>(null);
+    const [flowDefinition, setFlowDefinition] = useState<FlowDefinitionResponse | null>(null);
+    const [initialSpec, setInitialSpec] = useState<ReactFlowSpec | undefined>(undefined);
+    const [workflowName, setWorkflowName] = useState("New Workflow");
+    const [isLoading, setIsLoading] = useState(isEditing);
+    const [showSaveDialog, setShowSaveDialog] = useState(false);
+
+    // Save dialog form state
+    const [saveName, setSaveName] = useState("");
+    const [saveDescription, setSaveDescription] = useState("");
+    const [saveCategory, setSaveCategory] = useState<WorkflowCategory>("custom");
+
+    // Load existing workflow if editing (use Flow API for proper conversion)
+    useEffect(() => {
+        if (workflowId) {
+            setIsLoading(true);
+            // Use the Flow-specific API to get React Flow format
+            workflowService
+                .getFlowDefinition(workflowId)
+                .then((flowDef) => {
+                    setFlowDefinition(flowDef);
+                    setWorkflowName(flowDef.name);
+                    setSaveName(flowDef.name);
+                    setSaveDescription(flowDef.description || "");
+                    setSaveCategory(flowDef.category);
+                    // flow_definition is already in React Flow format from backend
+                    if (flowDef.flow_definition?.nodes && flowDef.flow_definition?.edges) {
+                        setInitialSpec(flowDef.flow_definition as ReactFlowSpec);
+                    }
+                })
+                .catch((err) => {
+                    console.error("Failed to load workflow:", err);
+                    // Fallback to standard definition API
+                    workflowService.getDefinition(workflowId)
+                        .then((def) => {
+                            setDefinition(def);
+                            setWorkflowName(def.name);
+                            setSaveName(def.name);
+                            setSaveDescription(def.description || "");
+                            setSaveCategory(def.category);
+                            // If bpmn_spec has nodes/edges (React Flow format), use it
+                            const spec = def.bpmn_spec as Record<string, unknown>;
+                            if (spec?.nodes && spec?.edges) {
+                                setInitialSpec(spec as unknown as ReactFlowSpec);
+                            }
+                        })
+                        .catch(() => {
+                            toast.error("Failed to load workflow definition");
+                        });
+                })
+                .finally(() => setIsLoading(false));
+        }
+    }, [workflowId, workflowService]);
+
+    // Pending spec waiting for save dialog submission
+    const [pendingSpec, setPendingSpec] = useState<ReactFlowSpec | null>(null);
+
+    // Handle save using Flow API for proper conversion
+    const handleSave = useCallback(
+        async (spec: ReactFlowSpec) => {
+            if (isEditing && workflowId) {
+                // Update existing workflow using Flow-specific API
+                try {
+                    const updatedFlow = await workflowService.saveFlowDefinition(workflowId, {
+                        nodes: spec.nodes as unknown as import("@/lib/services/workflow-service").FlowNode[],
+                        edges: spec.edges as unknown as import("@/lib/services/workflow-service").FlowEdge[],
+                    });
+                    setFlowDefinition(updatedFlow);
+                } catch (err) {
+                    console.error("Failed to save workflow:", err);
+                    throw err;
+                }
+            } else {
+                // Show save dialog for new workflow
+                setPendingSpec(spec);
+                setShowSaveDialog(true);
+            }
+        },
+        [isEditing, workflowId, workflowService]
+    );
+
+    // Handle save dialog submit
+    const handleSaveDialogSubmit = async () => {
+        if (!saveName.trim()) {
+            toast.error("Please enter a workflow name");
+            return;
+        }
+
+        try {
+            // Step 1: Create the workflow definition with metadata
+            const newDef = await workflowService.createDefinition({
+                name: saveName,
+                description: saveDescription,
+                category: saveCategory,
+                is_active: false,
+                is_template: false,
+            });
+
+            // Step 2: Save the flow spec using the Flow API for proper conversion
+            if (pendingSpec) {
+                await workflowService.saveFlowDefinition(newDef.id, {
+                    nodes: pendingSpec.nodes as unknown as import("@/lib/services/workflow-service").FlowNode[],
+                    edges: pendingSpec.edges as unknown as import("@/lib/services/workflow-service").FlowEdge[],
+                });
+            }
+
+            toast.success("Workflow definition created successfully");
+
+            setShowSaveDialog(false);
+            setPendingSpec(null);
+            // Redirect to edit mode with new ID
+            router.push(`/workflows/designer?id=${newDef.id}`);
+        } catch (err) {
+            console.error("Failed to create workflow:", err);
+            toast.error("Failed to create workflow definition");
+        }
+    };
+
+    if (isLoading) {
+        return (
+            <div className="h-screen flex items-center justify-center">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="h-screen">
+            {/* Header */}
+            <div className="flex items-center gap-2 px-4 py-2 border-b border-border bg-background shrink-0">
+                <Link href="/workflows/definitions">
+                    <Button variant="ghost" size="icon">
+                        <ArrowLeft className="h-4 w-4" />
+                    </Button>
+                </Link>
+                <h1 className="text-lg font-semibold">
+                    {isEditing ? "Edit Workflow" : "Create New Workflow"}
+                </h1>
+            </div>
+
+            {/* Canvas */}
+            <div className="flex-1 overflow-hidden">
+                <WorkflowCanvas
+                    initialSpec={initialSpec}
+                    workflowName={workflowName}
+                    onSave={handleSave}
+                />
+            </div>
+
+            {/* Save Dialog */}
+            <Dialog open={showSaveDialog} onOpenChange={setShowSaveDialog}>
+                <DialogContent>
+                    <DialogHeader>
+                        <DialogTitle>Save Workflow</DialogTitle>
+                        <DialogDescription>
+                            Enter the details for your new workflow definition.
+                        </DialogDescription>
+                    </DialogHeader>
+
+                    <div className="space-y-4 py-4">
+                        <div>
+                            <Label htmlFor="name">Name</Label>
+                            <Input
+                                id="name"
+                                value={saveName}
+                                onChange={(e) => setSaveName(e.target.value)}
+                                placeholder="Risk Assessment Workflow"
+                                className="mt-1"
+                            />
+                        </div>
+
+                        <div>
+                            <Label htmlFor="description">Description</Label>
+                            <Textarea
+                                id="description"
+                                value={saveDescription}
+                                onChange={(e) => setSaveDescription(e.target.value)}
+                                placeholder="Describe the purpose of this workflow..."
+                                className="mt-1"
+                                rows={3}
+                            />
+                        </div>
+
+                        <div>
+                            <Label htmlFor="category">Category</Label>
+                            <Select value={saveCategory} onValueChange={(v) => setSaveCategory(v as WorkflowCategory)}>
+                                <SelectTrigger className="mt-1">
+                                    <SelectValue placeholder="Select category" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="risk_assessment">Risk Assessment</SelectItem>
+                                    <SelectItem value="control_testing">Control Testing</SelectItem>
+                                    <SelectItem value="policy_approval">Policy Approval</SelectItem>
+                                    <SelectItem value="audit">Audit</SelectItem>
+                                    <SelectItem value="remediation">Remediation</SelectItem>
+                                    <SelectItem value="custom">Custom</SelectItem>
+                                </SelectContent>
+                            </Select>
+                        </div>
+                    </div>
+
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setShowSaveDialog(false)}>
+                            Cancel
+                        </Button>
+                        <Button onClick={handleSaveDialogSubmit}>
+                            Create Workflow
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+        </div>
+    );
+}
