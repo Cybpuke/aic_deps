@@ -1,0 +1,481 @@
+"use client";
+
+import React, { useCallback, useRef, useState } from "react";
+import { toast } from "sonner";
+import {
+    ReactFlow,
+    Background,
+    MiniMap,
+    useNodesState,
+    useEdgesState,
+    addEdge,
+    type Connection,
+    type Edge,
+    type Node,
+    ReactFlowProvider,
+    useReactFlow,
+    type NodeTypes,
+    type EdgeTypes,
+    MarkerType,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { DndContext, type DragEndEvent, DragOverlay, type DragStartEvent, useDroppable } from "@dnd-kit/core";
+// dagre is imported dynamically inside getLayoutedElements to avoid SSR issues
+
+import { cn } from "@/lib/utils";
+import { bpmnNodeTypes } from "./BpmnNodes";
+import { bpmnEdgeTypes } from "./BpmnEdges";
+import { NodePalette } from "./NodePalette";
+import { PropertiesPanel } from "./PropertiesPanel";
+import { WorkflowToolbar } from "./WorkflowToolbar";
+import { useFlowHistory } from "./useFlowHistory";
+import {
+    type BpmnNodeData,
+    type BpmnNodeType,
+    type BpmnEdgeData,
+    type ReactFlowSpec,
+    validateWorkflow,
+    type ValidationResult,
+    NODE_DIMENSIONS,
+} from "./types";
+
+// ============================================
+// Auto-layout using Dagre
+// ============================================
+
+async function getLayoutedElements(
+    nodes: Node[],
+    edges: Edge[],
+    direction: "TB" | "LR" = "LR"
+) {
+    const dagre = (await import("@dagrejs/dagre")).default;
+    const dagreGraph = new dagre.graphlib.Graph();
+    dagreGraph.setDefaultEdgeLabel(() => ({}));
+    dagreGraph.setGraph({ rankdir: direction, nodesep: 50, ranksep: 80 });
+
+    nodes.forEach((node) => {
+        const dims = NODE_DIMENSIONS[node.type as BpmnNodeType] || { width: 150, height: 50 };
+        dagreGraph.setNode(node.id, { width: dims.width, height: dims.height });
+    });
+
+    edges.forEach((edge) => {
+        dagreGraph.setEdge(edge.source, edge.target);
+    });
+
+    dagre.layout(dagreGraph);
+
+    const layoutedNodes = nodes.map((node) => {
+        const nodeWithPosition = dagreGraph.node(node.id);
+        const dims = NODE_DIMENSIONS[node.type as BpmnNodeType] || { width: 150, height: 50 };
+        return {
+            ...node,
+            position: {
+                x: nodeWithPosition.x - dims.width / 2,
+                y: nodeWithPosition.y - dims.height / 2,
+            },
+        };
+    });
+
+    return { nodes: layoutedNodes, edges };
+}
+
+// ============================================
+// Main Canvas Component (Inner)
+// ============================================
+
+interface WorkflowCanvasInnerProps {
+    initialSpec?: ReactFlowSpec;
+    workflowName: string;
+    onSave: (spec: ReactFlowSpec) => Promise<void>;
+    className?: string;
+}
+
+function WorkflowCanvasInner({
+    initialSpec,
+    workflowName,
+    onSave,
+    className,
+}: WorkflowCanvasInnerProps) {
+
+    const reactFlowWrapper = useRef<HTMLDivElement>(null);
+    const { setNodeRef: setDroppableRef } = useDroppable({ id: "workflow-canvas-drop-zone" });
+    const [nodes, setNodes, onNodesChange] = useNodesState(initialSpec?.nodes || []);
+    const [edges, setEdges, onEdgesChange] = useEdgesState(initialSpec?.edges || []);
+    const [selectedNode, setSelectedNode] = useState<Node | null>(null);
+    const [selectedEdge, setSelectedEdge] = useState<Edge | null>(null);
+    const [isDirty, setIsDirty] = useState(false);
+    const [isSaving, setIsSaving] = useState(false);
+    const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
+    const [activeDragItem, setActiveDragItem] = useState<string | null>(null);
+
+    // Auto-validate on node/edge changes (debounced)
+    React.useEffect(() => {
+        if (nodes.length === 0) return;
+        const timer = setTimeout(() => {
+            const spec: ReactFlowSpec = {
+                nodes: nodes as ReactFlowSpec["nodes"],
+                edges: edges as ReactFlowSpec["edges"],
+            };
+            setValidationResult(validateWorkflow(spec));
+        }, 500);
+        return () => clearTimeout(timer);
+    }, [nodes, edges]);
+
+    const { fitView, zoomIn, zoomOut, screenToFlowPosition } = useReactFlow();
+
+    // Undo/redo history management
+    const { canUndo, canRedo, takeSnapshot, undo, redo } = useFlowHistory();
+
+    // Handle edge connections
+    const onConnect = useCallback(
+        (params: Connection) => {
+            takeSnapshot(nodes, edges);
+            const newEdge: Edge = {
+                ...params,
+                id: `edge-${params.source}-${params.target}-${Date.now()}`,
+                source: params.source || "",
+                target: params.target || "",
+                data: {},
+            };
+            setEdges((eds) => addEdge(newEdge, eds));
+            setIsDirty(true);
+        },
+        [setEdges, nodes, edges, takeSnapshot]
+    );
+
+    // Handle node selection
+    const onNodeClick = useCallback(
+        (_: React.MouseEvent, node: Node) => {
+            setSelectedNode(node);
+            setSelectedEdge(null);
+        },
+        []
+    );
+
+    // Handle edge selection
+    const onEdgeClick = useCallback(
+        (_: React.MouseEvent, edge: Edge) => {
+            setSelectedEdge(edge);
+            setSelectedNode(null);
+        },
+        []
+    );
+
+    // Handle pane click (deselect)
+    const onPaneClick = useCallback(() => {
+        setSelectedNode(null);
+        setSelectedEdge(null);
+    }, []);
+
+    // Update node data
+    const handleNodeChange = useCallback(
+        (nodeId: string, data: Partial<BpmnNodeData>) => {
+            takeSnapshot(nodes, edges);
+            setNodes((nds) =>
+                nds.map((node) => {
+                    if (node.id === nodeId) {
+                        return { ...node, data: { ...node.data, ...data } };
+                    }
+                    return node;
+                })
+            );
+            setIsDirty(true);
+        },
+        [setNodes, nodes, edges, takeSnapshot]
+    );
+
+    // Update edge data
+    const handleEdgeChange = useCallback(
+        (edgeId: string, data: Partial<BpmnEdgeData>) => {
+            takeSnapshot(nodes, edges);
+            setEdges((eds) =>
+                eds.map((edge) => {
+                    if (edge.id === edgeId) {
+                        return { ...edge, data: { ...edge.data, ...data } };
+                    }
+                    return edge;
+                })
+            );
+            setIsDirty(true);
+        },
+        [setEdges, nodes, edges, takeSnapshot]
+    );
+
+    // Close properties panel
+    const handleCloseProperties = useCallback(() => {
+        setSelectedNode(null);
+        setSelectedEdge(null);
+    }, []);
+
+    // Drag and drop from palette
+    const onDragStart = (event: DragStartEvent) => {
+        setActiveDragItem(event.active.id as string);
+    };
+
+    const onDragEnd = (event: DragEndEvent) => {
+        setActiveDragItem(null);
+
+        if (!reactFlowWrapper.current) return;
+
+        const type = event.active.data.current?.type as BpmnNodeType;
+        const defaultData = event.active.data.current?.defaultData as Partial<BpmnNodeData>;
+
+        if (!type) return;
+
+        // Get the pointer position at the end of the drag
+        // activatorEvent is the original pointer event that started the drag
+        const activatorEvent = event.activatorEvent as PointerEvent;
+        const reactFlowBounds = reactFlowWrapper.current.getBoundingClientRect();
+
+        // Calculate where the pointer ended up (start position + delta)
+        const pointerX = activatorEvent.clientX + event.delta.x;
+        const pointerY = activatorEvent.clientY + event.delta.y;
+
+        // Only create node if dropped within the canvas bounds
+        if (
+            pointerX < reactFlowBounds.left ||
+            pointerX > reactFlowBounds.right ||
+            pointerY < reactFlowBounds.top ||
+            pointerY > reactFlowBounds.bottom
+        ) {
+            return;
+        }
+
+        const position = screenToFlowPosition({
+            x: pointerX,
+            y: pointerY,
+        });
+
+        const newNode: Node = {
+            id: `${type}-${Date.now()}`,
+            type,
+            position,
+            data: {
+                label: defaultData?.label || type,
+                ...defaultData,
+            },
+        };
+
+        takeSnapshot(nodes, edges);
+        setNodes((nds) => [...nds, newNode]);
+        setIsDirty(true);
+    };
+
+    // Toolbar actions
+    const handleSave = async () => {
+        console.log("[WorkflowCanvas] handleSave called");
+        // Run validation before save — block if errors exist
+        const spec: ReactFlowSpec = { nodes: nodes as ReactFlowSpec["nodes"], edges: edges as ReactFlowSpec["edges"] };
+        const result = validateWorkflow(spec);
+        setValidationResult(result);
+
+        if (!result.valid) {
+            const errorMessages = result.errors.map((e) => e.message).join(", ");
+            toast.error("Cannot save — validation errors", {
+                description: errorMessages,
+            });
+            console.log("[WorkflowCanvas] Validation failed:", errorMessages);
+            return;
+        }
+
+        setIsSaving(true);
+        try {
+            await onSave(spec);
+            setIsDirty(false);
+            toast.success("Workflow saved successfully");
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : "An error occurred while saving";
+            toast.error("Save failed", { description: msg });
+            console.error("[WorkflowCanvas] Save error:", err);
+        } finally {
+            setIsSaving(false);
+        }
+    };
+
+    const handleValidate = () => {
+        const spec: ReactFlowSpec = { nodes: nodes as ReactFlowSpec["nodes"], edges: edges as ReactFlowSpec["edges"] };
+        const result = validateWorkflow(spec);
+        setValidationResult(result);
+    };
+
+    const handleAutoLayout = async () => {
+        takeSnapshot(nodes, edges);
+        const { nodes: layoutedNodes, edges: layoutedEdges } = await getLayoutedElements(nodes, edges);
+        setNodes(layoutedNodes);
+        setEdges(layoutedEdges);
+        setIsDirty(true);
+        setTimeout(() => fitView({ padding: 0.2, duration: 300 }), 50);
+    };
+
+    const handleExport = () => {
+        const spec: ReactFlowSpec = { nodes: nodes as ReactFlowSpec["nodes"], edges: edges as ReactFlowSpec["edges"] };
+        const blob = new Blob([JSON.stringify(spec, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${workflowName || "workflow"}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+
+    const handleImport = () => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = ".json,.bpmn,.xml";
+        input.onchange = (e) => {
+            const file = (e.target as HTMLInputElement).files?.[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                const content = e.target?.result as string;
+                const isBpmn = file.name.endsWith(".bpmn") || file.name.endsWith(".xml");
+
+                try {
+                    let spec: ReactFlowSpec;
+
+                    if (isBpmn) {
+                        // Send BPMN XML to backend for conversion
+                        const { default: api } = await import("@/lib/utils/api");
+                        const response = await api.post("/api/workflows/definitions/import_bpmn/", {
+                            bpmn_xml: content,
+                        });
+                        spec = response.data.flow_spec as ReactFlowSpec;
+                        toast.success(`Imported: ${response.data.process_name || file.name}`);
+                    } else {
+                        // JSON import — parse directly
+                        spec = JSON.parse(content) as ReactFlowSpec;
+                        toast.success("Workflow imported from JSON");
+                    }
+
+                    takeSnapshot(nodes, edges);
+                    setNodes(spec.nodes || []);
+                    setEdges(spec.edges || []);
+                    setIsDirty(true);
+                    setTimeout(() => fitView({ padding: 0.2, duration: 300 }), 50);
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : "Invalid file format";
+                    toast.error("Import failed", { description: msg });
+                    console.error("Failed to import workflow:", err);
+                }
+            };
+            reader.readAsText(file);
+        };
+        input.click();
+    };
+
+    // Undo/redo handlers
+    const handleUndo = useCallback(() => {
+        undo(nodes, edges, setNodes, setEdges);
+    }, [nodes, edges, setNodes, setEdges, undo]);
+
+    const handleRedo = useCallback(() => {
+        redo(nodes, edges, setNodes, setEdges);
+    }, [nodes, edges, setNodes, setEdges, redo]);
+
+    // Cast node and edge types for React Flow
+    const nodeTypes: NodeTypes = bpmnNodeTypes as unknown as NodeTypes;
+    const edgeTypes: EdgeTypes = bpmnEdgeTypes as unknown as EdgeTypes;
+
+    return (
+        <DndContext onDragStart={onDragStart} onDragEnd={onDragEnd}>
+            <div className={cn("flex flex-col h-full", className)}>
+                <WorkflowToolbar
+                    workflowName={workflowName}
+                    isDirty={isDirty}
+                    isSaving={isSaving}
+                    validationResult={validationResult}
+                    canUndo={canUndo}
+                    canRedo={canRedo}
+                    onSave={handleSave}
+                    onValidate={handleValidate}
+                    onExport={handleExport}
+                    onImport={handleImport}
+                    onUndo={handleUndo}
+                    onRedo={handleRedo}
+                    onZoomIn={() => zoomIn({ duration: 300 })}
+                    onZoomOut={() => zoomOut({ duration: 300 })}
+                    onFitView={() => fitView({ padding: 0.2, duration: 300 })}
+                    onAutoLayout={handleAutoLayout}
+                />
+
+                <div className="flex flex-1 overflow-hidden">
+                    <NodePalette />
+
+                    <div ref={(el) => { reactFlowWrapper.current = el; setDroppableRef(el); }} className="flex-1">
+                        <ReactFlow
+                            nodes={nodes}
+                            edges={edges}
+                            onNodesChange={onNodesChange}
+                            onEdgesChange={onEdgesChange}
+                            onConnect={onConnect}
+                            onNodeClick={onNodeClick}
+                            onEdgeClick={onEdgeClick}
+                            onPaneClick={onPaneClick}
+                            nodeTypes={nodeTypes}
+                            edgeTypes={edgeTypes}
+                            fitView
+                            snapToGrid
+                            snapGrid={[15, 15]}
+                            defaultEdgeOptions={{
+                                type: "bpmn",
+                                markerEnd: {
+                                    type: MarkerType.ArrowClosed,
+                                    width: 20,
+                                    height: 20,
+                                },
+                            }}
+                            className="bg-muted/30"
+                        >
+                            <Background gap={15} size={1} />
+                            <MiniMap
+                                nodeStrokeWidth={3}
+                                zoomable
+                                pannable
+                                position="bottom-right"
+                                className="!bg-background !border-border"
+                            />
+                        </ReactFlow>
+                    </div>
+
+                    <PropertiesPanel
+                        selectedNode={selectedNode as Parameters<typeof PropertiesPanel>[0]["selectedNode"]}
+                        selectedEdge={selectedEdge as Parameters<typeof PropertiesPanel>[0]["selectedEdge"]}
+                        onNodeChange={handleNodeChange}
+                        onEdgeChange={handleEdgeChange}
+                        onClose={handleCloseProperties}
+                    />
+                </div>
+            </div>
+
+            {/* Drag overlay for visual feedback */}
+            <DragOverlay>
+                {activeDragItem ? (
+                    <div className="bg-primary/20 border-2 border-primary border-dashed rounded-lg p-4 opacity-80">
+                        <span className="text-sm font-medium">Drop on canvas</span>
+                    </div>
+                ) : null}
+            </DragOverlay>
+        </DndContext>
+    );
+}
+
+// ============================================
+// Exported Component with Provider
+// ============================================
+
+interface WorkflowCanvasProps {
+    initialSpec?: ReactFlowSpec;
+    workflowName: string;
+    onSave: (spec: ReactFlowSpec) => Promise<void>;
+    className?: string;
+}
+
+export function WorkflowCanvas(props: WorkflowCanvasProps) {
+    return (
+        <ReactFlowProvider>
+            <WorkflowCanvasInner {...props} />
+        </ReactFlowProvider>
+    );
+}
+
+export default WorkflowCanvas;
