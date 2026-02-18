@@ -1,14 +1,18 @@
-# Fix setuptools to the version ingestion actually requires
-sudo -u airflow /opt/airflow/venv/bin/pip install "setuptools~=78.1.1"
-
-# Verify ODBC driver installed
-odbcinst -q -d
-
-# Verify pyodbc works
-sudo -u airflow /opt/airflow/venv/bin/python -c "import pyodbc; print('version:', pyodbc.version); print('drivers:', pyodbc.drivers())"
-
-# Test network to MSSQL
-nc -zv 10.10.25.106 1433
-
-# Restart Airflow
-systemctl restart airflow-scheduler airflow-webserver
+sudo -u airflow /opt/airflow/venv/bin/python -c "
+import pyodbc
+conn_str = (
+    'DRIVER={ODBC Driver 18 for SQL Server};'
+    'SERVER=10.10.25.106,1433;'
+    'DATABASE=master;'
+    'UID=DataOfficeUser;'
+    'PWD=YOUR_ACTUAL_PASSWORD_HERE;'
+    'Encrypt=no;'
+    'TrustServerCertificate=yes;'
+)
+try:
+    conn = pyodbc.connect(conn_str, timeout=10)
+    print('SUCCESS! Connected to MSSQL')
+    conn.close()
+except Exception as e:
+    print(f'FAILED: {e}')
+"
