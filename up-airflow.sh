@@ -43,10 +43,12 @@ CURRENT_AIRFLOW_VERSION=$(sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/airflow ve
 echo "Current Airflow version: ${CURRENT_AIRFLOW_VERSION}"
 echo "Target Airflow version:  ${NEW_AIRFLOW_VERSION}"
 
+SKIP_UPGRADE=false
 if [ "${CURRENT_AIRFLOW_VERSION}" = "${NEW_AIRFLOW_VERSION}" ]; then
-    echo "Airflow is already at version ${NEW_AIRFLOW_VERSION}. Nothing to do."
-    exit 0
+    echo "Airflow is already at version ${NEW_AIRFLOW_VERSION}. Skipping upgrade, will verify dependencies..."
+    SKIP_UPGRADE=true
 fi
+if [ "${SKIP_UPGRADE}" = false ]; then
 
 # 1. Stop Airflow services
 echo ""
@@ -131,6 +133,14 @@ if [ -n "${OM_VERSION}" ]; then
 else
     echo "Warning: Could not detect OpenMetadata ingestion version. Skipping re-install."
     echo "You may need to manually re-install after upgrade."
+fi
+
+else
+    echo ""
+    echo "Skipping steps 1-5 (Airflow already at target version)."
+    # Still stop services for dependency install
+    systemctl stop airflow-scheduler || true
+    systemctl stop airflow-webserver || true
 fi
 
 # 6. Ensure ALL dependencies are intact (system + Python)
