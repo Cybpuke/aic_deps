@@ -1,37 +1,186 @@
-# values-deps.yaml (fixed)
+#!/bin/bash
 
-mysql:
-  image:
-    pullPolicy: IfNotPresent
+# Airflow Upgrade Script
+# Run on: Worker 2 (omd-wrkr2 / 192.168.5.242) — the Airflow node
+# Usage: sudo ./upgrade-airflow.sh <new_airflow_version>
+# Example: sudo ./upgrade-airflow.sh 2.10.4
 
-opensearch:
-  imagePullPolicy: IfNotPresent
+set -e
 
-airflow:
-  images:
-    airflow:
-      pullPolicy: IfNotPresent
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root"
+   exit 1
+fi
 
-  airflow:
-    extraVolumeMounts:
-      - mountPath: /airflow-logs
-        name: nfs-airflow-logs
-      - mountPath: /airflow-dags/dags
-        name: nfs-airflow-dags
-    extraVolumes:
-      - name: nfs-airflow-logs
-        persistentVolumeClaim:
-          claimName: openmetadata-dependencies-logs
-      - name: nfs-airflow-dags
-        persistentVolumeClaim:
-          claimName: openmetadata-dependencies-dags
-    config:
-      AIRFLOW__OPENMETADATA_AIRFLOW_APIS__DAG_GENERATED_CONFIGS: "/airflow-dags/dags"
+if [ -z "$1" ]; then
+    echo "Usage: sudo $0 <new_airflow_version>"
+    echo "Example: sudo $0 2.10.4"
+    exit 1
+fi
 
-  dags:
-    persistence:
-      enabled: false
+NEW_AIRFLOW_VERSION="$1"
+AIRFLOW_HOME="/opt/airflow"
+AIRFLOW_VENV="${AIRFLOW_HOME}/venv"
+AIRFLOW_USER="airflow"
+PYTHON_VERSION=$(${AIRFLOW_VENV}/bin/python --version 2>&1 | grep -oP '\d+\.\d+' | head -1)
 
-  logs:
-    persistence:
-      enabled: false
+echo "================================================================"
+echo "  Airflow Upgrade: current -> ${NEW_AIRFLOW_VERSION}"
+echo "  Airflow Home: ${AIRFLOW_HOME}"
+echo "  Python Version: ${PYTHON_VERSION}"
+echo "================================================================"
+
+# 0. Pre-flight checks
+echo ""
+echo "[Step 0] Pre-flight checks..."
+
+if [ ! -d "${AIRFLOW_VENV}" ]; then
+    echo "Error: Airflow venv not found at ${AIRFLOW_VENV}"
+    exit 1
+fi
+
+CURRENT_AIRFLOW_VERSION=$(sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/airflow version 2>/dev/null || echo "unknown")
+echo "Current Airflow version: ${CURRENT_AIRFLOW_VERSION}"
+echo "Target Airflow version:  ${NEW_AIRFLOW_VERSION}"
+
+if [ "${CURRENT_AIRFLOW_VERSION}" = "${NEW_AIRFLOW_VERSION}" ]; then
+    echo "Airflow is already at version ${NEW_AIRFLOW_VERSION}. Nothing to do."
+    exit 0
+fi
+
+# 1. Stop Airflow services
+echo ""
+echo "[Step 1] Stopping Airflow services..."
+systemctl stop airflow-scheduler || true
+systemctl stop airflow-webserver || true
+echo "Airflow services stopped."
+
+# Give processes time to fully exit
+sleep 5
+
+# 2. Backup current Airflow config
+echo ""
+echo "[Step 2] Backing up Airflow configuration..."
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_DIR="${AIRFLOW_HOME}/backup_${TIMESTAMP}"
+mkdir -p "${BACKUP_DIR}"
+
+cp "${AIRFLOW_HOME}/airflow.cfg" "${BACKUP_DIR}/" 2>/dev/null || true
+cp -r "${AIRFLOW_HOME}/dags" "${BACKUP_DIR}/" 2>/dev/null || true
+cp -r "${AIRFLOW_HOME}/plugins" "${BACKUP_DIR}/" 2>/dev/null || true
+
+# Save list of currently installed packages
+sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/pip freeze > "${BACKUP_DIR}/requirements_before.txt"
+echo "Backup saved to: ${BACKUP_DIR}"
+
+# 3. Upgrade pip and build tools
+echo ""
+echo "[Step 3] Upgrading pip and build tools..."
+sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/pip install --upgrade pip setuptools wheel
+
+# 4. Upgrade Airflow with constraints
+echo ""
+echo "[Step 4] Upgrading Apache Airflow to ${NEW_AIRFLOW_VERSION}..."
+CONSTRAINTS_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${NEW_AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+
+echo "Using constraints: ${CONSTRAINTS_URL}"
+
+# Verify the constraints file exists
+if ! curl -s --head "${CONSTRAINTS_URL}" | head -n 1 | grep -q "200"; then
+    echo "Warning: Constraints file not found at ${CONSTRAINTS_URL}"
+    echo "Trying without minor Python version..."
+    PYTHON_MAJOR_MINOR=$(echo ${PYTHON_VERSION} | cut -d. -f1,2)
+    CONSTRAINTS_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${NEW_AIRFLOW_VERSION}/constraints-${PYTHON_MAJOR_MINOR}.txt"
+    echo "Retrying with: ${CONSTRAINTS_URL}"
+    if ! curl -s --head "${CONSTRAINTS_URL}" | head -n 1 | grep -q "200"; then
+        echo "Error: Could not find valid constraints file. Aborting."
+        echo "Check available versions at: https://github.com/apache/airflow/tree/constraints-${NEW_AIRFLOW_VERSION}"
+        exit 1
+    fi
+fi
+
+sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/pip install --upgrade \
+    "apache-airflow[postgres]==${NEW_AIRFLOW_VERSION}" \
+    --constraint "${CONSTRAINTS_URL}"
+
+echo "Airflow package upgraded."
+
+# 5. Re-install OpenMetadata ingestion packages (they may have been affected)
+echo ""
+echo "[Step 5] Re-installing OpenMetadata ingestion packages..."
+
+# Try to detect the current OM version from installed packages
+OM_VERSION=$(sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/pip show openmetadata-ingestion 2>/dev/null | grep -i "^Version:" | awk '{print $2}')
+
+if [ -n "${OM_VERSION}" ]; then
+    echo "Detected OpenMetadata ingestion version: ${OM_VERSION}"
+    echo "Re-installing to ensure compatibility..."
+
+    # Downgrade setuptools temporarily for cx-Oracle build
+    sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/pip install "setuptools<78" wheel
+
+    if sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/pip install --upgrade --no-cache-dir \
+        "openmetadata-ingestion[all]==${OM_VERSION}" \
+        "openmetadata-managed-apis==${OM_VERSION}"; then
+        echo "OpenMetadata packages re-installed successfully."
+    else
+        echo "Warning: Could not re-install OpenMetadata packages."
+        echo "You may need to manually run:"
+        echo "  sudo -u airflow ${AIRFLOW_VENV}/bin/pip install openmetadata-ingestion[all]==${OM_VERSION}"
+    fi
+else
+    echo "Warning: Could not detect OpenMetadata ingestion version. Skipping re-install."
+    echo "You may need to manually re-install after upgrade."
+fi
+
+# 6. Run Airflow DB migration
+echo ""
+echo "[Step 6] Running Airflow database migration..."
+sudo -u ${AIRFLOW_USER} bash -c "
+    export AIRFLOW_HOME=${AIRFLOW_HOME}
+    source ${AIRFLOW_VENV}/bin/activate
+    airflow db migrate
+"
+echo "Database migration complete."
+
+# 7. Start Airflow services
+echo ""
+echo "[Step 7] Starting Airflow services..."
+systemctl start airflow-webserver
+systemctl start airflow-scheduler
+echo "Airflow services started."
+
+# 8. Verify
+echo ""
+echo "[Step 8] Verifying Airflow..."
+sleep 10
+
+NEW_VERSION=$(sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/airflow version 2>/dev/null || echo "unknown")
+echo "Airflow version after upgrade: ${NEW_VERSION}"
+
+# Wait for webserver to come up
+echo "Waiting for Airflow webserver to respond..."
+for i in {1..24}; do
+    if curl -s http://localhost:8080/health > /dev/null 2>&1; then
+        echo "Airflow webserver is healthy!"
+        break
+    fi
+    if [ $i -eq 24 ]; then
+        echo "Warning: Airflow webserver did not respond within 2 minutes."
+        echo "Check logs: journalctl -u airflow-webserver -n 50"
+    fi
+    sleep 5
+done
+
+echo ""
+echo "================================================================"
+echo "  Airflow upgrade complete: ${CURRENT_AIRFLOW_VERSION} -> ${NEW_VERSION}"
+echo "================================================================"
+echo ""
+echo "POST-UPGRADE CHECKLIST:"
+echo "  1. Verify DAGs are loading: http://192.168.5.242:8080"
+echo "  2. Check scheduler logs: journalctl -u airflow-scheduler -f"
+echo "  3. Check webserver logs: journalctl -u airflow-webserver -f"
+echo "  4. Test a sample ingestion pipeline from OpenMetadata UI"
+echo "  5. Backup is at: ${BACKUP_DIR}"
+echo ""
