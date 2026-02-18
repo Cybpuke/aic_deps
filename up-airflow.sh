@@ -133,9 +133,61 @@ else
     echo "You may need to manually re-install after upgrade."
 fi
 
-# 6. Run Airflow DB migration
+# 6. Ensure ALL dependencies are intact (system + Python)
 echo ""
-echo "[Step 6] Running Airflow database migration..."
+echo "[Step 6] Verifying and installing ALL required dependencies..."
+
+# --- System-level packages (RHEL/CentOS) ---
+echo "Checking system-level packages..."
+if [ -f /etc/redhat-release ]; then
+    dnf install -y --quiet \
+        unixODBC-devel \
+        libpq-devel \
+        gcc gcc-c++ make \
+        openssl-devel \
+        libffi-devel \
+        cyrus-sasl-devel \
+        openldap-devel \
+        krb5-devel \
+        libxml2-devel \
+        libxslt-devel \
+        zlib-devel \
+        pkgconf \
+        redhat-rpm-config \
+        2>/dev/null && echo "System packages: OK"
+fi
+
+# --- Microsoft ODBC Driver 18 (for MSSQL ingestion) ---
+if ! odbcinst -q -d 2>/dev/null | grep -qi "ODBC Driver 18"; then
+    echo "Installing Microsoft ODBC Driver 18 for SQL Server..."
+    if [ -f /etc/redhat-release ]; then
+        curl -s -o /etc/yum.repos.d/msprod.repo https://packages.microsoft.com/config/rhel/9/prod.repo
+        ACCEPT_EULA=Y dnf install -y msodbcsql18 2>/dev/null && echo "ODBC Driver 18: OK" || echo "Warning: ODBC Driver 18 install failed"
+    fi
+else
+    echo "ODBC Driver 18: Already installed"
+fi
+
+# --- Python packages in venv ---
+echo "Checking Python packages in Airflow venv..."
+sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/pip install --quiet \
+    pyodbc \
+    presidio-analyzer \
+    2>/dev/null && echo "Python packages (pyodbc, presidio): OK"
+
+# --- spaCy model ---
+if ! sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/python -c "import spacy; spacy.load('en_core_web_sm')" 2>/dev/null; then
+    echo "Installing spaCy language model..."
+    sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/python -m spacy download en_core_web_sm 2>/dev/null && echo "spaCy model: OK"
+else
+    echo "spaCy model: Already installed"
+fi
+
+echo "All dependencies verified."
+
+# 7. Run Airflow DB migration
+echo ""
+echo "[Step 7] Running Airflow database migration..."
 sudo -u ${AIRFLOW_USER} bash -c "
     export AIRFLOW_HOME=${AIRFLOW_HOME}
     source ${AIRFLOW_VENV}/bin/activate
@@ -143,16 +195,16 @@ sudo -u ${AIRFLOW_USER} bash -c "
 "
 echo "Database migration complete."
 
-# 7. Start Airflow services
+# 8. Start Airflow services
 echo ""
-echo "[Step 7] Starting Airflow services..."
+echo "[Step 8] Starting Airflow services..."
 systemctl start airflow-webserver
 systemctl start airflow-scheduler
 echo "Airflow services started."
 
-# 8. Verify
+# 9. Verify
 echo ""
-echo "[Step 8] Verifying Airflow..."
+echo "[Step 9] Verifying Airflow..."
 sleep 10
 
 NEW_VERSION=$(sudo -u ${AIRFLOW_USER} ${AIRFLOW_VENV}/bin/airflow version 2>/dev/null || echo "unknown")
